@@ -1,0 +1,49 @@
+{
+  "name": "odin-core-electron",
+  "version": "1.0.0",
+  "description": "ODIN Core Desktop App",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "dependencies": {
+    
+  },
+  "build": {
+    "appId": "com.example.odincore",
+    "productName": "ODINCoreApp",
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "node_modules/xterm/css/xterm.css"
+    ],
+    "extraResources": [
+      {
+        "from": "./python_src",
+        "to": "python_src",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}

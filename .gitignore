@@ -1,0 +1,8 @@
+/python_src/.env
+node_modules/
+/python_src/__pycache__
+/python_src/workspace/
+/python_src/metagpt/
+/python_src/output_browser/
+/python_src/data/
+/python_src/logs/
