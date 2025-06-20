@@ -91,6 +91,7 @@ if __name__ == "__main__":
     # Run the MCP server using stdio transport
     print("Starting GPT Researcher MCP server via stdio...")
     mcp.run(transport="stdio")
+    
     print("GPT Researcher MCP server stopped.")
 
 

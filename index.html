@@ -3,27 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <title>ODIN Core</title>
+    <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
     <style>
-        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; display: flex; flex-direction: column; font-family: sans-serif; background-color: #f0f0f0; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; display: flex; flex-direction: column; font-family: sans-serif; background-color: #23272e; /* Darker background */ color: #f0f0f0; }
         #gradio-container { flex-grow: 1; position: relative; display: flex; background-color: white; min-height: 200px; }
         #gradio-iframe { width: 100%; height: 100%; border: none; }
         #loading-message { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.2em; color: #333; background: rgba(255,255,255,0.9); padding: 20px; border-radius: 5px; z-index: 10; }
-        #terminal-output-panel {
+
+        #terminal-container {
             height: 300px; /* Adjust as needed */
-            background-color: #1e1e1e; /* Dark background */
-            color: #d4d4d4; /* Light text */
-            font-family: Consolas, "Courier New", monospace;
-            font-size: 13px;
-            padding: 10px;
-            overflow-y: auto; /* Allow scrolling */
-            white-space: pre-wrap; /* CRITICAL: Preserves newlines and wraps long lines */
+            background-color: #1e1e1e;
+            padding: 5px; /* Padding for the container around xterm */
             border-top: 1px solid #444;
             box-sizing: border-box;
+            overflow: hidden; /* xterm handles its own scroll */
         }
-        .log-stdout { color: #ccc; } /* Default stdout color */
-        .log-stderr { color: #f99157; } /* Orange/Yellow for stderr */
-        .log-status { color: #6699cc; font-style: italic; } /* Blue for Electron status */
-        .log-error  { color: #ff5555; font-weight: bold; } /* Red for Electron errors */
+        /* xterm.js will create its own viewport elements inside #terminal-container */
     </style>
 </head>
 <body>
@@ -31,46 +26,87 @@
         <div id="loading-message">Loading ODIN Core Interface... Please wait.</div>
         <iframe id="gradio-iframe" sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-modals"></iframe>
     </div>
-    <div id="terminal-output-panel"></div>
+    <div id="terminal-container"></div>
 
-    <script>
+    <script type="module">
+        // Using type="module" for imports
+        import { Terminal } from '../node_modules/@xterm/xterm/lib/xterm.js';
+        import { FitAddon } from '../node_modules/@xterm/addon-fit/lib/addon-fit.js';
+        // import { WebLinksAddon } from '../node_modules/@xterm/addon-web-links/lib/addon-web-links.js';
+
+
         const iframe = document.getElementById('gradio-iframe');
         const loadingMessage = document.getElementById('loading-message');
-        const terminalPanel = document.getElementById('terminal-output-panel');
+        const terminalContainer = document.getElementById('terminal-container');
 
-        function appendToTerminal(logData) {
-            const span = document.createElement('span');
-            if (logData.type) {
-                span.className = `log-${logData.type.toLowerCase()}`;
+        // --- Xterm.js Setup ---
+        const term = new Terminal({
+            cursorBlink: true,
+            convertEol: true, // Convert \n to \r\n for proper line endings in terminal
+            fontSize: 13,
+            fontFamily: 'Consolas, "Courier New", monospace',
+            theme: { // Example theme (customize as needed)
+                background: '#1e1e1e',
+                foreground: '#d4d4d4',
+                cursor: '#d4d4d4',
+                selectionBackground: '#555555',
             }
-            span.appendChild(document.createTextNode(logData.message));
-            terminalPanel.appendChild(span);
-            terminalPanel.scrollTop = terminalPanel.scrollHeight; // Auto-scroll
-        }
+        });
+        const fitAddon = new FitAddon();
+        term.loadAddon(fitAddon);
+        // const webLinksAddon = new WebLinksAddon();
+        // term.loadAddon(webLinksAddon); // Optional: for clickable links
 
-        appendToTerminal({type: 'status', message: 'Renderer: UI Initialized. Listening for backend logs...\n'});
+        term.open(terminalContainer);
+        fitAddon.fit(); // Initial fit
 
-        window.electronAPI.onTerminalLog(appendToTerminal);
+        // Handle resize
+        new ResizeObserver(() => {
+            try {
+                fitAddon.fit();
+                window.electronAPI.sendTerminalResize(term.cols, term.rows);
+            } catch (e) { /* ignore, can happen during initial setup */ }
+        }).observe(terminalContainer);
+        
+        window.addEventListener('resize', () => fitAddon.fit());
 
+
+        // Write initial message
+        term.writeln('\x1b[1;36mWelcome to ODIN Core Terminal\x1b[0m'); // Cyan color
+        term.writeln('Backend process logs will appear here...');
+        term.writeln('');
+
+        // Handle data from main process PTY
+        window.electronAPI.onPtyData((data) => {
+            term.write(data);
+        });
+
+        // Optional: Send input from terminal to PTY (e.g., for Ctrl+C)
+        term.onData(data => {
+            window.electronAPI.sendPtyInput(data);
+        });
+
+
+        // --- Gradio Iframe Loading (mostly same as before) ---
         window.electronAPI.onBackendDied((exitInfo) => {
-            appendToTerminal({type: 'error', message: `\n--- PYTHON BACKEND EXITED (Code: ${exitInfo.code}, Signal: ${exitInfo.signal}) ---\nCheck logs. Gradio interface may be unresponsive.\n`});
-            iframe.src = 'about:blank'; // Clear iframe
+            term.writeln(`\r\n\x1b[1;31m--- GRADIO BACKEND EXITED (Code: ${exitInfo.code}, Signal: ${exitInfo.signal}) ---\x1b[0m`);
+            term.writeln('\x1b[33mGradio interface may be unresponsive. Check logs.\x1b[0m\r\n');
+            iframe.src = 'about:blank';
             loadingMessage.textContent = 'Backend process terminated. Please restart or check logs.';
             loadingMessage.style.display = 'block';
         });
 
-        // --- Gradio Iframe Loading ---
         let gradioLoadAttempts = 0;
-        const maxGradioLoadAttempts = 15;
-        const gradioRetryDelay = 2000;
+        const maxGradioLoadAttempts = 20; // Increased attempts
+        const gradioRetryDelay = 2500; // Slightly increased delay
 
         window.electronAPI.onLoadGradio((gradioUrl) => {
-            appendToTerminal({type: 'status', message: `Renderer: Received Gradio URL (${gradioUrl}). Attempting load...\n`});
+            term.writeln(`\x1b[36mRenderer: Received Gradio URL (${gradioUrl}). Attempting load...\x1b[0m`);
             function attemptLoadGradio() {
                 if (gradioLoadAttempts >= maxGradioLoadAttempts) {
-                    const failMsg = `Failed to load Gradio from ${gradioUrl} after ${maxGradioLoadAttempts} attempts.\n`;
+                    const failMsg = `Failed to load Gradio from ${gradioUrl} after ${maxGradioLoadAttempts} attempts.`;
                     loadingMessage.innerHTML = failMsg.replace(/\n/g, '<br>');
-                    appendToTerminal({type: 'error', message: failMsg});
+                    term.writeln(`\x1b[1;31m${failMsg}\x1b[0m`);
                     return;
                 }
                 gradioLoadAttempts++;
@@ -78,22 +114,24 @@
                 
                 fetch(gradioUrl, { method: 'HEAD', mode: 'no-cors' })
                     .then(() => {
-                        appendToTerminal({type: 'status', message: 'Renderer: Gradio server responsive. Setting iframe source.\n'});
+                        term.writeln('\x1b[32mRenderer: Gradio server responsive. Setting iframe source.\x1b[0m');
                         iframe.src = gradioUrl;
+                        // loadingMessage will be hidden by iframe.onload
                     })
                     .catch(error => {
-                        appendToTerminal({type: 'stderr', message: `Renderer (Attempt ${gradioLoadAttempts}): Gradio connection failed: ${error.message}\n`});
+                        term.writeln(`\x1b[33mRenderer (Attempt ${gradioLoadAttempts}): Gradio connection failed: ${error.message}\x1b[0m`);
                         setTimeout(attemptLoadGradio, gradioRetryDelay);
                     });
             }
             iframe.onload = () => {
-                appendToTerminal({type: 'status', message: 'Renderer: Gradio iframe content loaded.\n'});
+                term.writeln('\x1b[32mRenderer: Gradio iframe content loaded.\x1b[0m');
                 loadingMessage.style.display = 'none';
             };
-            iframe.onerror = (e) => appendToTerminal({type: 'error', message: `Renderer: Gradio iframe load error: ${e.type}\n`});
+            iframe.onerror = (e) => term.writeln(`\x1b[1;31mRenderer: Gradio iframe load error: ${e.type}\x1b[0m`);
             attemptLoadGradio();
         });
-        appendToTerminal({type: 'status', message: "Renderer: Loaded. Waiting for Gradio URL.\n"});
+        term.writeln("\x1b[36mRenderer: UI Initialized. Waiting for Gradio URL and backend logs...\x1b[0m");
+
     </script>
 </body>
 </html>

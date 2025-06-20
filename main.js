@@ -1,32 +1,37 @@
 // File: main.js
 const { app, BrowserWindow, shell, ipcMain } = require('electron');
 const path = require('path');
-const { spawn } = require('child_process'); // Using spawn directly
 const os = require('os');
+const pty = require('node-pty');
 
 let mainWindow;
-let pythonProcess = null;
-const GRADIO_PORT = 7860;
+const GRADIO_PORT = 7860; // Keep this, app.py still uses it
 const GRADIO_URL = `http://127.0.0.1:${GRADIO_PORT}`;
 
-const CONDA_ENV_NAME = 'odin';
-const CONDA_EXECUTABLE = 'conda'; // Assumes 'conda' is in system PATH
+const PYTHON_VENV_NAME = 'odin'; // Your venv name
 
-// Helper to send logs to renderer
-function sendLogToRenderer(type, message) {
-    if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('terminal-log', { type, message });
+// Child processes
+let gradioPtyProcess = null;
+let browserUsePtyProcess = null;
+
+// Helper to determine Python executable path within the venv
+function getPythonExecutablePath(basePythonSrcDir) {
+    if (os.platform() === 'win32') {
+        return path.join(basePythonSrcDir, PYTHON_VENV_NAME, 'Scripts', 'python.exe');
     }
+    return path.join(basePythonSrcDir, PYTHON_VENV_NAME, 'bin', 'python');
 }
 
 function createWindow() {
     mainWindow = new BrowserWindow({
         width: 1200,
-        height: 950,
+        height: 950, // Adjusted height for terminal
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
             contextIsolation: true,
-            nodeIntegration: false,
+            nodeIntegration: false, // Important for security
+            // nodeIntegrationInWorker: false, // If you use workers
+            // webviewTag: false, // If you were using webview
         },
     });
     mainWindow.loadFile('index.html');
@@ -37,145 +42,136 @@ function createWindow() {
         return { action: 'deny' };
     });
     mainWindow.on('closed', () => mainWindow = null);
+
+    // Relay terminal resize events
+    ipcMain.on('terminal-resize', (event, { cols, rows }) => {
+        if (gradioPtyProcess) {
+            try {
+                gradioPtyProcess.resize(cols, rows);
+            } catch (e) {
+                console.warn("Error resizing Gradio PTY:", e.message);
+            }
+        }
+        // You might want a separate terminal or combined output for browserUsePtyProcess
+        // If combined, this resize applies to the shared terminal.
+        // If separate, you'd need to manage its resize too.
+    });
+
+    // Relay input to the Gradio PTY (e.g., for Ctrl+C)
+    ipcMain.on('terminal-input', (event, data) => {
+        if (gradioPtyProcess) {
+            gradioPtyProcess.write(data);
+        }
+    });
 }
 
-function startPythonBackend() {
-    const pythonAppDir = app.isPackaged
-        ? path.join(process.resourcesPath, 'python_src')
+function startPythonProcess(scriptName, processLogPrefix, port = null) {
+    const pythonSrcDir = app.isPackaged
+        ? path.join(process.resourcesPath, 'app', 'python_src') // Adjusted for "app/python_src"
         : path.join(__dirname, 'python_src');
-    const scriptRelativePath = 'app.py';
 
-    const logAndSend = (type, msg) => {
-        const fullMsg = `[Backend-${type.toUpperCase()}]: ${msg}`;
-        console.log(fullMsg); // Log to main Electron console
-        sendLogToRenderer(type, msg); // Send original message to renderer
-    };
+    const pythonExecutable = getPythonExecutablePath(pythonSrcDir);
+    const scriptPath = path.join(pythonSrcDir, scriptName);
 
-    logAndSend('status', `Python app dir: ${pythonAppDir}, script: ${scriptRelativePath}`);
-    logAndSend('status', `Using Conda env: ${CONDA_ENV_NAME} via ${CONDA_EXECUTABLE}`);
-
-    const command = CONDA_EXECUTABLE;
-    const args = [
-        'run',
-        '-n', CONDA_ENV_NAME,
-        '--no-capture-output', // Still good for conda to not buffer excessively
-        'python',
-        '-u', // CRITICAL: Unbuffered Python output for stdout/stderr
-        scriptRelativePath
-    ];
-
-    const options = {
-        cwd: pythonAppDir,
-        env: {
-            ...process.env,
-            PYTHONUNBUFFERED: "1", // Double ensure unbuffered for Python
-            PYTHONIOENCODING: "UTF-8", // Ensure UTF-8 for output
-            // GRADIO_SERVER_NAME: "127.0.0.1", // Optional
-            // GRADIO_SERVER_PORT: GRADIO_PORT.toString(),
-        },
-        // Process group handling for termination:
-        detached: os.platform() !== 'win32', // On Unix, create a new process group
-    };
-
-    if (os.platform() === 'win32') {
-        options.shell = true; // `conda` is often a .bat on Windows, needing a shell
-        // `detached` behaves differently with `shell: true` on Windows.
-        // `taskkill` will be our primary tool for Windows termination.
+    const fs = require('fs');
+    if (!fs.existsSync(pythonExecutable)) {
+        const errorMsg = `Python executable not found for venv '${PYTHON_VENV_NAME}': ${pythonExecutable}`;
+        console.error(errorMsg);
+        if (mainWindow && mainWindow.webContents) {
+            mainWindow.webContents.send('pty-data', `[${processLogPrefix}-ERROR] ${errorMsg}\r\n`);
+        }
+        return null;
+    }
+    if (!fs.existsSync(scriptPath)) {
+        const errorMsg = `Python script not found: ${scriptPath}`;
+        console.error(errorMsg);
+        if (mainWindow && mainWindow.webContents) {
+            mainWindow.webContents.send('pty-data', `[${processLogPrefix}-ERROR] ${errorMsg}\r\n`);
+        }
+        return null;
     }
 
-    logAndSend('status', `Spawning: ${command} ${args.join(' ')}`);
-    pythonProcess = spawn(command, args, options);
-
-    // --- Stream Handling ---
-    // Make sure to handle encoding correctly if output isn't plain ASCII
-    pythonProcess.stdout.setEncoding('utf8');
-    pythonProcess.stderr.setEncoding('utf8');
-
-    pythonProcess.stdout.on('data', (data) => {
-        // data is already a string due to setEncoding
-        process.stdout.write(data); // Mirror to Electron's main console (where you ran npm start)
-        sendLogToRenderer('stdout', data);
+    const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash'; // Or 'cmd.exe'
+    const ptyProcess = pty.spawn(pythonExecutable, ['-u', scriptPath], { // -u for unbuffered
+        name: 'xterm-color',
+        cols: 80, // Initial columns
+        rows: 30, // Initial rows
+        cwd: pythonSrcDir, // Run script from its directory
+        env: {
+            ...process.env,
+            PYTHONUNBUFFERED: "1",
+            PYTHONIOENCODING: "UTF-8",
+            // GRADIO_SERVER_PORT: port ? port.toString() : undefined // app.py handles its own port
+        },
+        // useConpty: os.platform() === 'win32' // Use ConPTY on Windows if available (default)
     });
 
-    pythonProcess.stderr.on('data', (data) => {
-        process.stderr.write(data); // Mirror to Electron's main console
-        sendLogToRenderer('stderr', data);
-    });
-
-    pythonProcess.on('error', (err) => {
-        logAndSend('error', `Failed to start Python process: ${err.message}`);
-        pythonProcess = null;
-    });
-
-    pythonProcess.on('close', (code, signal) => {
-        logAndSend('status', `Python process exited (code: ${code}, signal: ${signal})`);
-        pythonProcess = null;
+    ptyProcess.onData((data) => {
+        // process.stdout.write(`[${processLogPrefix}] ${data}`); // Log to main Electron console
         if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
-            if (code !== 0 || signal) { // If exited with error or was signaled
-                 mainWindow.webContents.send('backend-died', {code, signal});
+            mainWindow.webContents.send('pty-data', `[${processLogPrefix}] ${data}`);
+        }
+    });
+
+    ptyProcess.onExit(({ exitCode, signal }) => {
+        const exitMsg = `[${processLogPrefix}] Process exited (code: ${exitCode}, signal: ${signal})\r\n`;
+        console.log(exitMsg);
+        if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('pty-data', exitMsg);
+            if (processLogPrefix === "GRADIO") { // If the main Gradio server dies
+                 mainWindow.webContents.send('backend-died', {code: exitCode, signal});
             }
         }
     });
-    logAndSend('status', 'Python backend process initiated.');
+    console.log(`[${processLogPrefix}] Python process '${scriptName}' initiated with PTY.`);
+    return ptyProcess;
 }
 
 app.on('ready', () => {
     console.log("Electron app ready.");
-    startPythonBackend();
-    createWindow();
+    createWindow(); // Create window first so it can receive logs
 
+    // Start the mcp_browseruse.py server
+    browserUsePtyProcess = startPythonProcess('mcp_browseruse.py', "BROWSER_SSE");
+
+    // Start the main Gradio app.py server
+    gradioPtyProcess = startPythonProcess('app.py', "GRADIO", GRADIO_PORT);
+
+
+    // Give Python server some time to start before attempting to load Gradio in iframe.
     setTimeout(() => {
-        if (mainWindow && pythonProcess) {
+        if (mainWindow && gradioPtyProcess) {
             console.log(`Attempting to trigger Gradio page load: ${GRADIO_URL}`);
             mainWindow.webContents.send('load-gradio', GRADIO_URL);
-        } else if (mainWindow && !pythonProcess) {
-            const msg = "Python backend process failed to start. Check logs in main terminal and Electron UI.";
+        } else if (mainWindow && !gradioPtyProcess) {
+            const msg = "Gradio backend process failed to start. Check logs in main terminal and Electron UI.\r\n";
             console.error(msg);
-            if(mainWindow.webContents) sendLogToRenderer('error', msg);
+            if(mainWindow.webContents) mainWindow.webContents.send('pty-data', `[ELECTRON-ERROR] ${msg}`);
         }
-    }, 7000); // Delay for backend to start
+    }, 7000); // Increased delay for backend to start, especially with PTY
 });
 
-app.on('will-quit', () => {
-    if (pythonProcess) {
-        console.log('Terminating Python backend process and its children...');
-        sendLogToRenderer('status', 'Exiting: Terminating Python backend...');
-
-        const pid = pythonProcess.pid;
-        if (os.platform() === 'win32') {
-            // On Windows, pythonProcess.pid is the PID of the shell (cmd.exe/powershell.exe)
-            // if shell:true was used. taskkill /T /F will kill the shell and its descendants.
-            try {
-                // spawn is used here to run taskkill asynchronously and not block the quit.
-                spawn('taskkill', ['/PID', pid.toString(), '/F', '/T'], { detached: true, stdio: 'ignore' }).unref();
-                console.log(`Sent taskkill /F /T to PID ${pid}`);
-            } catch (e) {
-                console.error("taskkill command failed:", e);
-                // Fallback to killing the direct shell process if taskkill spawn fails (unlikely)
-                if(pythonProcess && !pythonProcess.killed) pythonProcess.kill('SIGKILL');
-            }
-        } else {
-            // On Unix-like systems (Linux, macOS):
-            // If `detached: true` was used, pythonProcess.pid is the process group ID (PGID) leader.
-            // Sending a signal to -pid (negative PID) kills the entire process group.
-            try {
-                process.kill(-pid, 'SIGINT'); // Send SIGINT to the process group
-                console.log(`Sent SIGINT to process group -${pid}`);
-                // Set a timeout to forcefully kill if SIGINT doesn't work
-                setTimeout(() => {
-                    if (pythonProcess && !pythonProcess.killed) { // Check if still running
-                        console.log(`Process group -${pid} did not exit, sending SIGKILL.`);
-                        try { process.kill(-pid, 'SIGKILL'); }
-                        catch (e) { console.warn("Failed to SIGKILL process group (already exited?):", e.message); }
-                    }
-                }, 2000); // 2-second grace period
-            } catch (e) {
-                console.error(`Failed to send SIGINT to process group -${pid}. Trying direct SIGKILL to ${pid}:`, e.message);
-                if(pythonProcess && !pythonProcess.killed) pythonProcess.kill('SIGKILL'); // Fallback
-            }
+function killPtyProcess(ptyProc, name) {
+    if (ptyProc) {
+        console.log(`Terminating ${name} PTY process (PID: ${ptyProc.pid})...`);
+        try {
+            // Sending SIGKILL directly. For more grace, try 'SIGINT' or ptyProc.write('\x03') first.
+            ptyProc.kill('SIGKILL'); // Or a more graceful signal like 'SIGTERM'
+            console.log(`${name} PTY process kill signal sent.`);
+        } catch (e) {
+            console.error(`Error killing ${name} PTY process: ${e.message}`);
         }
-        pythonProcess = null; // Assume it will be killed
     }
+    return null;
+}
+
+app.on('will-quit', () => {
+    console.log('Terminating backend processes...');
+    if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('pty-data', '[ELECTRON] Exiting: Terminating backend processes...\r\n');
+    }
+    gradioPtyProcess = killPtyProcess(gradioPtyProcess, "Gradio");
+    browserUsePtyProcess = killPtyProcess(browserUsePtyProcess, "BrowserUse SSE");
 });
 
 app.on('window-all-closed', () => (process.platform !== 'darwin') && app.quit());

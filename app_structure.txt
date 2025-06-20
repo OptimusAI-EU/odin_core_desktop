@@ -1,0 +1,20 @@
+odin-core-electron/
+├── package.json
+├── main.js             # Electron main process
+├── preload.js          # Electron preload script
+├── index.html          # HTML for the Electron window
+├── renderer.js         # JavaScript for index.html (optional for simple iframe)
+│
+└── python_src/           # Your Python application files
+    ├── app.py            # Your modified Gradio script
+    ├── .env              # Your environment variables
+    ├── client_multi_server.py
+    ├── langchain_mcp_adapters/
+    │   └── ...
+    ├── mcp_software_company.py
+    ├── mcp_deep_researcher.py
+    ├── mcp_data_interpreter.py
+    └── mcp_browseruse.py # And any other mcp_*.py scripts
+    # IMPORTANT: Ensure all necessary Python modules and files for app.py are here
+    # You might need to create a virtual environment within python_src/ or ensure
+    # the system Python has all dependencies (gradio, dotenv, langchain, etc.)

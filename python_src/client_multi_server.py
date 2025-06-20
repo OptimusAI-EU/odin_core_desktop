@@ -20,10 +20,7 @@ from langchain_core.tools import BaseTool
 # load_mcp_tools might not be needed if MultiServerMCPClient provides get_tools()
 # from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.prebuilt import create_react_agent
-from langchain_anthropic import ChatAnthropic
-from langchain_openai import ChatOpenAI
-from langchain_groq import ChatGroq
-from langchain_ollama import ChatOllama
+from langchain_ollama import ChatOllama  # We'll just use Ollama for now
 
 # Environment Loading
 from dotenv import load_dotenv
@@ -71,7 +68,12 @@ class MultiServerMCPClientWrapper:
 
             # Get tools from all connected servers
             print("Loading tools from all connected servers...")
-            self.tools = self.client.get_tools() # Use the client's method
+            try:
+                # Try async version first
+                self.tools = await self.client.get_tools()
+            except TypeError:
+                # Fallback to sync version if get_tools is not async
+                self.tools = self.client.get_tools()
             print(f"Tools loaded: {[tool.name for tool in self.tools]}")
 
             if not self.tools:
