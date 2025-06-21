@@ -2,17 +2,17 @@
 const { app, BrowserWindow, shell, ipcMain } = require('electron');
 const path = require('path');
 const os = require('os');
-const pty = require('node-pty');
+const { spawn } = require('child_process');
 
 let mainWindow;
 const GRADIO_PORT = 7860; // Keep this, app.py still uses it
 const GRADIO_URL = `http://127.0.0.1:${GRADIO_PORT}`;
 
-const PYTHON_VENV_NAME = 'odin'; // Your venv name
+const PYTHON_VENV_NAME = 'odin311'; // Your venv name
 
 // Child processes
-let gradioPtyProcess = null;
-let browserUsePtyProcess = null;
+let gradioProcess = null;
+let browserUseProcess = null;
 
 // Helper to determine Python executable path within the venv
 function getPythonExecutablePath(basePythonSrcDir) {
@@ -30,8 +30,6 @@ function createWindow() {
             preload: path.join(__dirname, 'preload.js'),
             contextIsolation: true,
             nodeIntegration: false, // Important for security
-            // nodeIntegrationInWorker: false, // If you use workers
-            // webviewTag: false, // If you were using webview
         },
     });
     mainWindow.loadFile('index.html');
@@ -42,32 +40,11 @@ function createWindow() {
         return { action: 'deny' };
     });
     mainWindow.on('closed', () => mainWindow = null);
-
-    // Relay terminal resize events
-    ipcMain.on('terminal-resize', (event, { cols, rows }) => {
-        if (gradioPtyProcess) {
-            try {
-                gradioPtyProcess.resize(cols, rows);
-            } catch (e) {
-                console.warn("Error resizing Gradio PTY:", e.message);
-            }
-        }
-        // You might want a separate terminal or combined output for browserUsePtyProcess
-        // If combined, this resize applies to the shared terminal.
-        // If separate, you'd need to manage its resize too.
-    });
-
-    // Relay input to the Gradio PTY (e.g., for Ctrl+C)
-    ipcMain.on('terminal-input', (event, data) => {
-        if (gradioPtyProcess) {
-            gradioPtyProcess.write(data);
-        }
-    });
 }
 
 function startPythonProcess(scriptName, processLogPrefix, port = null) {
     const pythonSrcDir = app.isPackaged
-        ? path.join(process.resourcesPath, 'app', 'python_src') // Adjusted for "app/python_src"
+        ? path.join(process.resourcesPath, 'app', 'python_src')
         : path.join(__dirname, 'python_src');
 
     const pythonExecutable = getPythonExecutablePath(pythonSrcDir);
@@ -91,75 +68,73 @@ function startPythonProcess(scriptName, processLogPrefix, port = null) {
         return null;
     }
 
-    const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash'; // Or 'cmd.exe'
-    const ptyProcess = pty.spawn(pythonExecutable, ['-u', scriptPath], { // -u for unbuffered
-        name: 'xterm-color',
-        cols: 80, // Initial columns
-        rows: 30, // Initial rows
-        cwd: pythonSrcDir, // Run script from its directory
-        env: {
-            ...process.env,
-            PYTHONUNBUFFERED: "1",
-            PYTHONIOENCODING: "UTF-8",
-            // GRADIO_SERVER_PORT: port ? port.toString() : undefined // app.py handles its own port
-        },
-        // useConpty: os.platform() === 'win32' // Use ConPTY on Windows if available (default)
+    const args = ['-u', scriptPath];
+    const env = {
+        ...process.env,
+        PYTHONUNBUFFERED: "1",
+        PYTHONIOENCODING: "UTF-8",
+    };
+    const child = spawn(pythonExecutable, args, {
+        cwd: pythonSrcDir,
+        env,
+        shell: false,
     });
 
-    ptyProcess.onData((data) => {
-        // process.stdout.write(`[${processLogPrefix}] ${data}`); // Log to main Electron console
+    child.stdout.on('data', (data) => {
         if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('pty-data', `[${processLogPrefix}] ${data}`);
+            mainWindow.webContents.send('pty-data', `[${processLogPrefix}] ${data.toString()}`);
         }
     });
-
-    ptyProcess.onExit(({ exitCode, signal }) => {
-        const exitMsg = `[${processLogPrefix}] Process exited (code: ${exitCode}, signal: ${signal})\r\n`;
+    child.stderr.on('data', (data) => {
+        if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('pty-data', `[${processLogPrefix}-ERR] ${data.toString()}`);
+        }
+    });
+    child.on('exit', (code, signal) => {
+        const exitMsg = `[${processLogPrefix}] Process exited (code: ${code}, signal: ${signal})\r\n`;
         console.log(exitMsg);
         if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('pty-data', exitMsg);
-            if (processLogPrefix === "GRADIO") { // If the main Gradio server dies
-                 mainWindow.webContents.send('backend-died', {code: exitCode, signal});
+            if (processLogPrefix === "GRADIO") {
+                mainWindow.webContents.send('backend-died', { code, signal });
             }
         }
     });
-    console.log(`[${processLogPrefix}] Python process '${scriptName}' initiated with PTY.`);
-    return ptyProcess;
+    console.log(`[${processLogPrefix}] Python process '${scriptName}' initiated.`);
+    return child;
 }
 
 app.on('ready', () => {
     console.log("Electron app ready.");
-    createWindow(); // Create window first so it can receive logs
+    createWindow();
 
     // Start the mcp_browseruse.py server
-    browserUsePtyProcess = startPythonProcess('mcp_browseruse.py', "BROWSER_SSE");
+    browserUseProcess = startPythonProcess('mcp_browseruse.py', "BROWSER_SSE");
 
     // Start the main Gradio app.py server
-    gradioPtyProcess = startPythonProcess('app.py', "GRADIO", GRADIO_PORT);
-
+    gradioProcess = startPythonProcess('app.py', "GRADIO", GRADIO_PORT);
 
     // Give Python server some time to start before attempting to load Gradio in iframe.
     setTimeout(() => {
-        if (mainWindow && gradioPtyProcess) {
+        if (mainWindow && gradioProcess) {
             console.log(`Attempting to trigger Gradio page load: ${GRADIO_URL}`);
             mainWindow.webContents.send('load-gradio', GRADIO_URL);
-        } else if (mainWindow && !gradioPtyProcess) {
+        } else if (mainWindow && !gradioProcess) {
             const msg = "Gradio backend process failed to start. Check logs in main terminal and Electron UI.\r\n";
             console.error(msg);
             if(mainWindow.webContents) mainWindow.webContents.send('pty-data', `[ELECTRON-ERROR] ${msg}`);
         }
-    }, 7000); // Increased delay for backend to start, especially with PTY
+    }, 7000);
 });
 
-function killPtyProcess(ptyProc, name) {
-    if (ptyProc) {
-        console.log(`Terminating ${name} PTY process (PID: ${ptyProc.pid})...`);
+function killProcess(childProc, name) {
+    if (childProc) {
+        console.log(`Terminating ${name} process (PID: ${childProc.pid})...`);
         try {
-            // Sending SIGKILL directly. For more grace, try 'SIGINT' or ptyProc.write('\x03') first.
-            ptyProc.kill('SIGKILL'); // Or a more graceful signal like 'SIGTERM'
-            console.log(`${name} PTY process kill signal sent.`);
+            childProc.kill('SIGKILL');
+            console.log(`${name} process kill signal sent.`);
         } catch (e) {
-            console.error(`Error killing ${name} PTY process: ${e.message}`);
+            console.error(`Error killing ${name} process: ${e.message}`);
         }
     }
     return null;
@@ -168,10 +143,10 @@ function killPtyProcess(ptyProc, name) {
 app.on('will-quit', () => {
     console.log('Terminating backend processes...');
     if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('pty-data', '[ELECTRON] Exiting: Terminating backend processes...\r\n');
+        mainWindow.webContents.send('pty-data', '[ELECTRON] Exiting: Terminating backend processes...\r\n');
     }
-    gradioPtyProcess = killPtyProcess(gradioPtyProcess, "Gradio");
-    browserUsePtyProcess = killPtyProcess(browserUsePtyProcess, "BrowserUse SSE");
+    gradioProcess = killProcess(gradioProcess, "Gradio");
+    browserUseProcess = killProcess(browserUseProcess, "BrowserUse SSE");
 });
 
 app.on('window-all-closed', () => (process.platform !== 'darwin') && app.quit());
